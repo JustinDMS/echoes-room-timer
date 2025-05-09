@@ -1,4 +1,10 @@
 import dolphin_memory_engine as dme
+from time import sleep
+from enum import Enum
+
+class Mode(Enum):
+    DEFAULT = 0
+    VERBOSE = 1
 
 ROOM = 0x803DCD80
 PTR_GAMESTATE = 0x803C5C9C
@@ -310,6 +316,18 @@ WORLD_MAP = {
     0x1BAA96C2 : SANCTUARY_FORTRESS
 }
 
+def get_mode():
+    _m = input("Enter 1 to enable pause detection\nThis outputs the time when the in-game timer is paused (text boxes, cutscenes, etc)\n")
+    try:
+        if int(_m) == 1:
+            print("Enabled")
+            return Mode.VERBOSE
+        print("Ignoring")
+        return Mode.DEFAULT
+    except ValueError:
+        print("Ignoring")
+        return Mode.DEFAULT
+
 def is_equal_approx(a, b, tolerance=0.001):
     if a == b:
         return True
@@ -330,28 +348,101 @@ def get_time():
     addr = dme.follow_pointers(PTR_GAMESTATE, [TIME_OFFSET])
     return dme.read_double(addr)
 
+class MemoryWatcher:
+    def __init__(self, read_func, callback=None):
+        self.read_func = read_func
+        self.callback = callback
+        self.previous_value = None
+        self.current_value = None
+
+    def check(self):
+        """Read memory and check if value has changed"""
+        self.current_value = self.read_func()
+        if self.previous_value is None:
+            self.previous_value = self.current_value
+            return False
+        
+        if self.current_value != self.previous_value:
+            if self.callback:
+                self.callback(self.previous_value, self.current_value)
+            self.previous_value = self.current_value
+            return True
+        return False
+
 def main():
     dme.hook()
     if not dme.is_hooked():
         print("Failed to hook dolphin!")
         return
 
-    print("Hook sucessful!")
-    while True:
+    ## Constants
+
+    # Twice per frame
+    CHECK_INTERVAL = 0.008
+
+    # 8 frames / ~0.13 seconds
+    # Should be short enough to preserve accuracy and long
+    # enough to ignore small things like completing a scan
+    PAUSE_DETECT = 16 
+    
+    ## Variables
+    current_world = get_world()
+    current_room = get_room()
+    start_time = get_time()
+    current_time = 0
+    # Pause detection
+    mode = get_mode()
+    if mode == Mode.VERBOSE:
+        time_check_counter = 0
+        paused = False
+        paused_room_printed = False
+
+    ## Callbacks for MemoryWatchers
+
+    def room_changed(old_room, _new_room):
+        nonlocal current_world, current_room, start_time, current_time
+        room_time = get_time() - start_time
+
+        if not is_equal_approx(room_time, 0):
+            print(f'{room_time:7.3f}: {get_room_name(current_world, old_room)}')
+        
         current_world = get_world()
         current_room = get_room()
         start_time = get_time()
+        current_time = 0
+    
+    def time_changed(_old_time, _new_time):
+        nonlocal current_time
+        current_time = get_time() - start_time
 
-        while get_room() == current_room:
-            continue
-        
-        # If the time is 0, skip output
-        # This prevents a 0.000 room time from being shown when taking an elevator
-        room_time = get_time() - start_time
-        if is_equal_approx(room_time, 0):
-            continue
-        
-        print(f'{room_time:7.3f}: {get_room_name(current_world, current_room)}')
+    room_watcher = MemoryWatcher(get_room, room_changed)
+    time_watcher = MemoryWatcher(get_time, time_changed)
+    
+    ## Main loop
+
+    print("\nScanning...")
+    while True:
+        if mode == Mode.DEFAULT:
+            room_watcher.check()
+        else:
+            if room_watcher.check():
+                paused_room_printed = False
+            
+            if time_watcher.check():
+                time_check_counter = 0
+                paused = False
+            elif not paused:
+                time_check_counter += 1
+                if time_check_counter >= PAUSE_DETECT:
+                    if not paused_room_printed:
+                        print(f'   | {get_room_name(current_world, current_room)}')
+                        paused_room_printed = True
+                    print(f'   | {current_time:.3f}')
+                    paused = True
+
+        sleep(CHECK_INTERVAL)
+
+#=========================
 
 if __name__ == '__main__':
     main()
