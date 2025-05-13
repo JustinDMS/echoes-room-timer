@@ -384,6 +384,7 @@ def main():
     current_room = get_room()
     start_time = get_time()
     current_time = 0
+    savestate_room = None
 
     # Pause detection
     time_check_counter = 0
@@ -393,12 +394,23 @@ def main():
 
     ## Callbacks for MemoryWatchers
 
-    def room_changed(old_room, _new_room):
-        nonlocal current_world, current_room, start_time, current_time, paused_room_printed, prev_pause_time
+    def room_changed(old_room, new_room):
+        nonlocal current_world, current_room, start_time, current_time, paused_room_printed, prev_pause_time, savestate_room
         room_time = get_time() - start_time
 
-        if not is_equal_approx(room_time, 0):
+        # Load savestate detected
+        if room_time < 0:
+            savestate_room = get_room()
+            paused_room_printed = False
+            prev_pause_time = 0
+        
+        # Don't output if you're leaving the room that you went to after savestating
+        # Also don't output if the time is 0 (elevator/portal cutscenes)
+        elif not savestate_room == old_room and not is_equal_approx(room_time, 0):
+            if mode == 1 and not is_equal_approx(prev_pause_time, 0): # Pause Detection Enabled
+                print(f'   | {room_time - prev_pause_time:13.3f}')
             print(f'{room_time:7.3f}: {get_room_name(current_world, old_room)}')
+            savestate_room = None
         
         current_world = get_world()
         current_room = get_room()
@@ -421,9 +433,9 @@ def main():
     print("\nScanning...")
     while True:
         room_watcher.check()
-
         if (
             mode == 1 and # Pause Detection Enabled
+            room_watcher.current_value != savestate_room and # Player didn't just load a savestate
             not time_watcher.check() and # IGT has not changed
             not paused
             ):
@@ -435,7 +447,13 @@ def main():
                     print(f'   | {get_room_name(current_world, current_room)}')
                     paused_room_printed = True
                 
-                print(f'   | {current_time:6.3f} {current_time - prev_pause_time:6.3f}')
+                # If it's the first pause, current_time == delta
+                # Display current time in place of delta
+                if is_equal_approx(prev_pause_time, 0):
+                    print(f'   | {current_time:13.3f}')
+                else:
+                    print(f'   | {current_time:6.3f} {current_time - prev_pause_time:6.3f}')
+                
                 prev_pause_time = current_time
         
         sleep(CHECK_INTERVAL)
