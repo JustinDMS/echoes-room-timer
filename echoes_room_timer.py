@@ -1,20 +1,17 @@
 import dolphin_memory_engine as dme
 from time import sleep
 
-# Addresses
-ROOM = 0x803DCD80
+# Shared address(es)
 PTR_GAMESTATE = 0x803C5C9C
-WORLD_OFFSET = 0x4
-TIME_OFFSET = 0x48
 
-# Twice per IGT frame (0.016s)
-CHECK_INTERVAL = 0.008
+# Tweaks
+FRAME_TIME = 1/60
+CHECK_INTERVAL = 4 # Number of times per frame
+SLEEP_TIME = FRAME_TIME / CHECK_INTERVAL
+PAUSE_DETECT_WINDOW = CHECK_INTERVAL * 30 # Number of frames before a pause is detected
+SAVESTATE_WINDOW = 75 # Number of frames after a savestate where time output is blocked. Only decreases when time changes
 
-# 8 frames / ~0.13 seconds
-# Should be short enough to preserve accuracy and long enough to ignore small things like completing a scan
-PAUSE_DETECT = 16 
-
-# ID -> Room Name
+# Room Name Data
 TEMPLE_GROUNDS = {
      0 : "Landing Site",
      1 : "Service Access",
@@ -309,8 +306,6 @@ SANCTUARY_FORTRESS = {
     65 : "Aerie",
     66 : "Hive Summit"
 }
-
-# ID -> Room Map
 WORLD_MAP = {
     0x3BFA3EFF : TEMPLE_GROUNDS,
     0x863FCD72 : GREAT_TEMPLE,
@@ -319,17 +314,9 @@ WORLD_MAP = {
     0x1BAA96C2 : SANCTUARY_FORTRESS
 }
 
-def get_mode():
-    _m = input(
-        "Enter 1 to enable pause detection\n"
-        "This outputs the time when the in-game timer is paused (text boxes, cutscenes, etc)\n"
-        )
-    if _m.strip() == "1":
-        print("Enabled")
-        return 1
-
-    print("Ignoring")
-    return 0
+# Enum
+ERROR = -1
+OK    =  0
 
 def is_equal_approx(a, b, tolerance=0.001):
     if a == b:
@@ -341,126 +328,168 @@ def get_room_name(world_id, room_id):
     return WORLD_MAP[world_id][room_id]
 
 def get_world():
+    WORLD_OFFSET = 0x4
+
     addr = dme.follow_pointers(PTR_GAMESTATE, [WORLD_OFFSET])
     return dme.read_word(addr)
 
 def get_room():
+    ROOM = 0x803DCD80
+
     return dme.read_word(ROOM)
 
 def get_time():
+    TIME_OFFSET = 0x48
+
     addr = dme.follow_pointers(PTR_GAMESTATE, [TIME_OFFSET])
     return dme.read_double(addr)
 
 class MemoryWatcher:
-    def __init__(self, read_func, callback):
-        self.read_func = read_func
-        self.callback = callback
-        self.previous_value = None
-        self.current_value = None
+    savestate_flag = False
+    just_savestated_flag = False
 
-    # Returns True when value has changed
-    def check(self):
-        """Read memory and check if value has changed"""
+    def __init__(self, _read_func, _on_changed_func, _on_unchanged_func):
+        self.read_func = _read_func
+        self.on_changed_func = _on_changed_func
+        self.on_unchanged_func = _on_unchanged_func
+
         self.current_value = self.read_func()
-        if self.previous_value is None:
-            self.previous_value = self.current_value
+        self.previous_value = None
+
+    def update(self):
+        """Read memory and check if value has changed"""
+        self.previous_value = self.current_value
+        self.current_value = self.read_func()
+
+        if self.current_value == self.previous_value:
+            self.on_unchanged_func()
             return False
         
-        if self.current_value != self.previous_value:
-            self.callback(self.previous_value, self.current_value)
-            self.previous_value = self.current_value
-            return True
-        return False
+        self.on_changed_func(self.previous_value, self.current_value)
+        return True
 
-def main():
+def scan(watchers: tuple[MemoryWatcher, ...]):
+    """Safely update all watchers"""
+    try:
+        for w in watchers:
+            w.update()
+        return OK
+    except (KeyError, RuntimeError):
+        return ERROR
+
+def validate_gamestate():
+    """Checks if in-game"""
+    INVALID_WORLDS = [
+        0xFFFFFFFF, # Startup sequence
+        0x69802220, # Main Menu
+        ]
+    
+    print(" > Checking if in-game...", end='')
+
+    if get_world() in INVALID_WORLDS:
+        print("Error. Make sure you've loaded into a save.")
+        return ERROR
+    
+    print("Ok!")
+    return OK
+
+def validate_game():
+    """Checks if game is Echoes"""
+    MEMORY_START = 0x80000000
+    LENGTH = 6
+    ECHOES = [0x47, 0x32, 0x4D, 0x45, 0x30, 0x31] # G2ME01 in individual bytes
+
+    for i in range(LENGTH):
+        if dme.read_byte(MEMORY_START + i) != ECHOES[i]:
+            return ERROR
+
+    return OK
+
+def hook():
+    print(" > Attempting to connect to Dolphin...", end='')
+
     dme.hook()
     if not dme.is_hooked():
-        print("Failed to hook dolphin!")
-        return
+        print("Failed. (Is the game running?)")
+        return ERROR
     
-    mode = get_mode()
+    print("Success!")
+    return OK
 
-    current_world = get_world()
-    current_room = get_room()
-    start_time = get_time()
-    current_time = 0
-    savestate_room = None
+def main():
+    if not (
+        hook() == OK and           # Dolphin open?
+        validate_game() == OK and  # Correct game?
+        validate_gamestate() == OK # In-game?
+        ):
+        return ERROR
 
-    # Pause detection
-    time_check_counter = 0
+    game_time = get_time()
+    room_time_start = game_time
     paused = False
-    paused_room_printed = False
-    prev_pause_time = 0
+    paused_frame_count = 0
+    savestate_window = 0
 
-    ## Callbacks for MemoryWatchers
+    def time_changed(previous, current):
+        nonlocal game_time, paused_frame_count, paused, savestate_window
+        delta_time = current - previous
+        savestate_window = max(0, savestate_window - 1)
 
-    def room_changed(old_room, new_room):
-        nonlocal current_world, current_room, start_time, current_time, paused_room_printed, prev_pause_time, savestate_room
-        room_time = get_time() - start_time
+        if MemoryWatcher.just_savestated_flag:
+            MemoryWatcher.just_savestated_flag = False
 
-        # Load savestate detected
-        if room_time < 0:
-            savestate_room = get_room()
-            paused_room_printed = False
-            prev_pause_time = 0
+        # Savestate loaded
+        if delta_time >= FRAME_TIME * 3 or delta_time < 0:
+            #print("# Savestate flag: True")
+            print(" ------")
+            MemoryWatcher.savestate_flag = True
+            MemoryWatcher.just_savestated_flag = True
+            savestate_window = SAVESTATE_WINDOW
         
-        # Don't output if you're leaving the room that you went to after savestating
-        # Also don't output if the time is 0 (elevator/portal cutscenes)
-        elif not savestate_room == old_room and not is_equal_approx(room_time, 0):
-            if mode == 1 and not is_equal_approx(prev_pause_time, 0): # Pause Detection Enabled
-                print(f'   | {room_time - prev_pause_time:13.3f}')
-            print(f'{room_time:7.3f}: {get_room_name(current_world, old_room)}')
-            savestate_room = None
-        
-        current_world = get_world()
-        current_room = get_room()
-        start_time = get_time()
-        current_time = 0
-        paused_room_printed = False
-        prev_pause_time = 0
-    
-    def time_changed(_old_time, new_time):
-        nonlocal current_time, time_check_counter, paused
-        current_time = new_time - start_time
-        time_check_counter = 0
         paused = False
-
-    room_watcher = MemoryWatcher(get_room, room_changed)
-    time_watcher = MemoryWatcher(get_time, time_changed)
+        game_time = current
+        paused_frame_count = 0
     
-    ## Main loop
-
-    print("\nScanning...")
-    while True:
-        room_watcher.check()
-        if (
-            mode == 1 and # Pause Detection Enabled
-            room_watcher.current_value != savestate_room and # Player didn't just load a savestate
-            not time_watcher.check() and # IGT has not changed
-            not paused
-            ):
-            time_check_counter += 1
-            if time_check_counter >= PAUSE_DETECT:
-                paused = True
-
-                if not paused_room_printed:
-                    print(f'   | {get_room_name(current_world, current_room)}')
-                    paused_room_printed = True
-                
-                # If it's the first pause, current_time == delta
-                # Display current time in place of delta
-                if is_equal_approx(prev_pause_time, 0):
-                    print(f'   | {current_time:13.3f}')
-                else:
-                    print(f'   | {current_time:6.3f} {current_time - prev_pause_time:6.3f}')
-                
-                prev_pause_time = current_time
+    def time_unchanged():
+        nonlocal paused, paused_frame_count, game_time, room_time_start
+        if paused:
+            return
         
-        sleep(CHECK_INTERVAL)
+        paused_frame_count += 1
 
-        
+        if paused_frame_count >= PAUSE_DETECT_WINDOW:
+            paused = True
+            if not is_equal_approx(game_time - room_time_start, 0) and savestate_window <= 0:
+                print(f'{game_time - room_time_start:7.3f}')
 
-#=========================
+    def room_changed(previous, current):
+        nonlocal game_time, room_time_start, savestate_window
+        room_time = game_time - room_time_start
+
+        if not MemoryWatcher.just_savestated_flag and savestate_window <= 0:
+            MemoryWatcher.savestate_flag = False
+            #print("Savestate flag: False")
+
+        if not MemoryWatcher.savestate_flag and not is_equal_approx(room_time, 0):
+            print(f'{room_time:7.3f}: {get_room_name(get_world(), previous)}')
+
+        room_time_start = get_time()
+
+    # Unused
+    def room_unchanged():
+        pass
+
+    time_watcher = MemoryWatcher(get_time, time_changed, time_unchanged)
+    room_watcher = MemoryWatcher(get_room, room_changed, room_unchanged)
+
+    print(" > Scanning...\n")
+    while scan( (time_watcher, room_watcher) ) == OK:
+        sleep(SLEEP_TIME)
+    
+    print("Error! Hopefully you just closed the game.")
+
+##########################
 
 if __name__ == '__main__':
     main()
+    
