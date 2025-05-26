@@ -1,15 +1,15 @@
 import dolphin_memory_engine as dme
 from time import sleep
 
-# Shared address(es)
+# Shared addresses
 PTR_GAMESTATE = 0x803C5C9C
+TIME_OFFSET = 0x48
 
 # Tweaks
 FRAME_TIME = 1/60
 CHECK_INTERVAL = 4 # Number of times per frame
 SLEEP_TIME = FRAME_TIME / CHECK_INTERVAL
-PAUSE_DETECT_WINDOW = CHECK_INTERVAL * 30 # Number of frames before a pause is detected
-SAVESTATE_WINDOW = 75 # Number of frames after a savestate where time output is blocked. Only decreases when time changes
+PAUSE_DETECT_WINDOW = CHECK_INTERVAL * 75 # Number of frames before a pause is detected
 
 # Room Name Data
 TEMPLE_GROUNDS = {
@@ -318,7 +318,7 @@ WORLD_MAP = {
 ERROR = -1
 OK    =  0
 
-def is_equal_approx(a, b, tolerance=0.001):
+def is_equal_approx(a, b, tolerance=0.002):
     if a == b:
         return True
 
@@ -333,25 +333,29 @@ def get_world():
     addr = dme.follow_pointers(PTR_GAMESTATE, [WORLD_OFFSET])
     return dme.read_word(addr)
 
+# Unused
+def set_room():
+    pass
+
 def get_room():
     ROOM = 0x803DCD80
 
     return dme.read_word(ROOM)
 
-def get_time():
-    TIME_OFFSET = 0x48
+def set_time(value: float):
+    addr = dme.follow_pointers(PTR_GAMESTATE, [TIME_OFFSET])
+    dme.write_double(addr, value)
 
+def get_time():
     addr = dme.follow_pointers(PTR_GAMESTATE, [TIME_OFFSET])
     return dme.read_double(addr)
 
 class MemoryWatcher:
-    savestate_flag = False
-    just_savestated_flag = False
-
-    def __init__(self, _read_func, _on_changed_func, _on_unchanged_func):
+    def __init__(self, _read_func, _write_func, _on_changed_callback, _on_unchanged_callback):
         self.read_func = _read_func
-        self.on_changed_func = _on_changed_func
-        self.on_unchanged_func = _on_unchanged_func
+        self.write_func = _write_func
+        self.on_changed_callback = _on_changed_callback
+        self.on_unchanged_callback = _on_unchanged_callback
 
         self.current_value = self.read_func()
         self.previous_value = None
@@ -362,11 +366,18 @@ class MemoryWatcher:
         self.current_value = self.read_func()
 
         if self.current_value == self.previous_value:
-            self.on_unchanged_func()
+            self.on_unchanged_callback()
             return False
         
-        self.on_changed_func(self.previous_value, self.current_value)
+        self.on_changed_callback(self.previous_value, self.current_value)
         return True
+    
+    def write(self, value):
+        self.write_func(value)
+
+def was_savestate_loaded(previous, current):
+    delta = current - previous
+    return delta >= (FRAME_TIME * 3)
 
 def scan(watchers: tuple[MemoryWatcher, ...]):
     """Safely update all watchers"""
@@ -385,9 +396,8 @@ def validate_gamestate():
         ]
     
     print(" > Checking if in-game...", end='')
-
     if get_world() in INVALID_WORLDS:
-        print("Error. Make sure you've loaded into a save.")
+        print("Failed. Make sure you're loaded into a save.")
         return ERROR
     
     print("Ok!")
@@ -399,10 +409,17 @@ def validate_game():
     LENGTH = 6
     ECHOES = [0x47, 0x32, 0x4D, 0x45, 0x30, 0x31] # G2ME01 in individual bytes
 
+    print(" > Making sure you're playing Echoes...", end='')
     for i in range(LENGTH):
-        if dme.read_byte(MEMORY_START + i) != ECHOES[i]:
+        value = dme.read_byte(MEMORY_START + i)
+        if value == 0:
+            print("Failed. Wait for the game to finish booting before trying to connect.")
             return ERROR
-
+        if value != ECHOES[i]:
+            print("This is not the Metroid Prime 2: Echoes game disc. Please insert the Metroid Prime 2: Echoes game disc.")
+            return ERROR
+    
+    print("Ok!")
     return OK
 
 def hook():
@@ -410,83 +427,79 @@ def hook():
 
     dme.hook()
     if not dme.is_hooked():
-        print("Failed. (Is the game running?)")
+        print("Failed. Make sure the game is running.")
         return ERROR
     
-    print("Success!")
+    print("Ok!")
     return OK
 
 def main():
-    if not (
-        hook() == OK and           # Dolphin open?
-        validate_game() == OK and  # Correct game?
-        validate_gamestate() == OK # In-game?
-        ):
-        return ERROR
+    while True:
+        try:
+            while not (
+                hook() == OK and           # Dolphin open?
+                validate_game() == OK and  # Correct game?
+                validate_gamestate() == OK # In-game?
+                ):
+                input(" > Press enter to try again...\n")
+        except RuntimeError:
+            print("Runtime Error. Failed to read game memory.")
+            dme.un_hook()
 
-    game_time = get_time()
-    room_time_start = game_time
-    paused = False
-    paused_frame_count = 0
-    savestate_window = 0
+            input(" > Press enter to try again...\n")
+            continue
 
-    def time_changed(previous, current):
-        nonlocal game_time, paused_frame_count, paused, savestate_window
-        delta_time = current - previous
-        savestate_window = max(0, savestate_window - 1)
-
-        if MemoryWatcher.just_savestated_flag:
-            MemoryWatcher.just_savestated_flag = False
-
-        # Savestate loaded
-        if delta_time >= FRAME_TIME * 3 or delta_time < 0:
-            #print("# Savestate flag: True")
-            print(" ------")
-            MemoryWatcher.savestate_flag = True
-            MemoryWatcher.just_savestated_flag = True
-            savestate_window = SAVESTATE_WINDOW
-        
+        game_time = 0
         paused = False
-        game_time = current
         paused_frame_count = 0
-    
-    def time_unchanged():
-        nonlocal paused, paused_frame_count, game_time, room_time_start
-        if paused:
-            return
+        savestate_flag = False
+
+        def time_changed(previous, current):
+            nonlocal game_time, paused, paused_frame_count, savestate_flag
+
+            savestate_flag = was_savestate_loaded(previous, current)
+            game_time = current
+            paused = False
+            paused_frame_count = 0
+
+        def time_unchanged():
+            nonlocal game_time, paused, paused_frame_count
+            if paused:
+                return
+
+            paused_frame_count += 1
+            if paused_frame_count >= PAUSE_DETECT_WINDOW:
+                paused = True
+                if not is_equal_approx(game_time, 0) and not is_equal_approx(game_time, FRAME_TIME):
+                    print(f'{game_time:7.3f}')
+
+        def room_changed(previous, current):
+            nonlocal game_time, savestate_flag
+
+            if not is_equal_approx(game_time, 0) and not savestate_flag:
+                print(f'{game_time:7.3f}: {get_room_name(get_world(), previous)}')
+
+            if savestate_flag:
+                savestate_flag = False
+                return # Don't overwrite time
+
+            time_watcher.write(0)
+
+        # Unused
+        def room_unchanged():
+            pass
         
-        paused_frame_count += 1
+        time_watcher = MemoryWatcher(get_time, set_time, time_changed, time_unchanged)
+        room_watcher = MemoryWatcher(get_room, set_room, room_changed, room_unchanged)
 
-        if paused_frame_count >= PAUSE_DETECT_WINDOW:
-            paused = True
-            if not is_equal_approx(game_time - room_time_start, 0) and savestate_window <= 0:
-                print(f'{game_time - room_time_start:7.3f}')
+        print(" > Scanning...\n")
+        while scan( (time_watcher, room_watcher) ) == OK:
+            sleep(SLEEP_TIME)
 
-    def room_changed(previous, current):
-        nonlocal game_time, room_time_start, savestate_window
-        room_time = game_time - room_time_start
+        print("\n > Error! Hopefully you just closed the game.")
+        dme.un_hook()
 
-        if not MemoryWatcher.just_savestated_flag and savestate_window <= 0:
-            MemoryWatcher.savestate_flag = False
-            #print("Savestate flag: False")
-
-        if not MemoryWatcher.savestate_flag and not is_equal_approx(room_time, 0):
-            print(f'{room_time:7.3f}: {get_room_name(get_world(), previous)}')
-
-        room_time_start = get_time()
-
-    # Unused
-    def room_unchanged():
-        pass
-
-    time_watcher = MemoryWatcher(get_time, time_changed, time_unchanged)
-    room_watcher = MemoryWatcher(get_room, room_changed, room_unchanged)
-
-    print(" > Scanning...\n")
-    while scan( (time_watcher, room_watcher) ) == OK:
-        sleep(SLEEP_TIME)
-    
-    print("Error! Hopefully you just closed the game.")
+        input(" > Press enter to try again...\n")
 
 ##########################
 
