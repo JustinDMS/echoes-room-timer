@@ -388,8 +388,12 @@ class MemoryWatcher:
         self.write_func(value)
 
 def was_savestate_loaded(previous, current):
+    WINDOW = FRAME_TIME * 3
     delta = current - previous
-    return delta >= (FRAME_TIME * 3)
+    return (
+        delta > WINDOW or # IGT made a > 3 frame jump
+        delta < 0 or      # IGT went backwards
+        is_equal_approx(delta, WINDOW)) # Check exactly 3 frame jump
 
 def scan(watchers: tuple[MemoryWatcher, ...]):
     """Safely update all watchers"""
@@ -469,7 +473,7 @@ def main():
         proximity_frame_count = 0
 
         def time_changed(previous, current):
-            nonlocal game_time, paused, paused_frame_count, savestate_flag, proximity_frame_count, world
+            nonlocal game_time, world, paused, paused_frame_count, savestate_flag, proximity_frame_count
 
             savestate_flag = was_savestate_loaded(previous, current)
             game_time = current
@@ -495,9 +499,13 @@ def main():
                     print(f'{game_time:7.3f} Pause')
 
         def proximity_load_changed(previous, current):
-            nonlocal game_time, proximity_frame_count
+            nonlocal game_time, savestate_flag, proximity_frame_count
             
-            if not proximity_watcher.output_disabled and proximity_frame_count <= 0:
+            if (
+                not proximity_watcher.output_disabled and 
+                proximity_frame_count <= 0 and
+                not savestate_flag
+                ):
                 print(f'{game_time:7.3f} Load')
                 proximity_frame_count = PROXIMITY_IGNORE_WINDOW
         
