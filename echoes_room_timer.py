@@ -1,5 +1,6 @@
-import dolphin_memory_engine as dme
+import sys
 from time import sleep
+import dolphin_memory_engine as dme
 
 # Shared addresses
 PTR_GAMESTATE = 0x803C5C9C
@@ -10,6 +11,7 @@ FRAME_TIME = 1/60
 CHECK_INTERVAL = 4 # Number of times per frame
 SLEEP_TIME = FRAME_TIME / CHECK_INTERVAL
 PAUSE_DETECT_WINDOW = CHECK_INTERVAL * 75 # Number of frames before a pause is detected
+PROXIMITY_IGNORE_WINDOW = CHECK_INTERVAL * 2 # Number of frames to ignore output when a proximity load is hit
 
 # Room Name Data
 TEMPLE_GROUNDS = {
@@ -324,6 +326,15 @@ def is_equal_approx(a, b, tolerance=0.002):
 
     return abs(a - b) < tolerance
 
+# Unused
+def set_proximity_load():
+    pass
+
+def get_proximity_load():
+    PROXIMITY_LOAD = 0x803C5CC3
+
+    return dme.read_byte(PROXIMITY_LOAD)
+
 def get_room_name(world_id, room_id):
     return WORLD_MAP[world_id][room_id]
 
@@ -351,11 +362,12 @@ def get_time():
     return dme.read_double(addr)
 
 class MemoryWatcher:
-    def __init__(self, _read_func, _write_func, _on_changed_callback, _on_unchanged_callback):
+    def __init__(self, _read_func, _write_func, _on_changed_callback, _on_unchanged_callback, _output_disabled):
         self.read_func = _read_func
         self.write_func = _write_func
         self.on_changed_callback = _on_changed_callback
         self.on_unchanged_callback = _on_unchanged_callback
+        self.output_disabled = _output_disabled
 
         self.current_value = self.read_func()
         self.previous_value = None
@@ -395,7 +407,7 @@ def validate_gamestate():
         0x69802220, # Main Menu
         ]
     
-    print(" > Checking if in-game...", end='')
+    print(" > Checking if in-game...               ", end='')
     if get_world() in INVALID_WORLDS:
         print("Failed. Make sure you're loaded into a save.")
         return ERROR
@@ -409,7 +421,7 @@ def validate_game():
     LENGTH = 6
     ECHOES = [0x47, 0x32, 0x4D, 0x45, 0x30, 0x31] # G2ME01 in individual bytes
 
-    print(" > Making sure you're playing Echoes...", end='')
+    print(" > Making sure you're playing Echoes... ", end='')
     for i in range(LENGTH):
         value = dme.read_byte(MEMORY_START + i)
         if value == 0:
@@ -423,7 +435,7 @@ def validate_game():
     return OK
 
 def hook():
-    print(" > Attempting to connect to Dolphin...", end='')
+    print(" > Attempting to connect to Dolphin...  ", end='')
 
     dme.hook()
     if not dme.is_hooked():
@@ -450,17 +462,21 @@ def main():
             continue
 
         game_time = 0
+        world = get_world()
         paused = False
         paused_frame_count = 0
         savestate_flag = False
+        proximity_frame_count = 0
 
         def time_changed(previous, current):
-            nonlocal game_time, paused, paused_frame_count, savestate_flag
+            nonlocal game_time, paused, paused_frame_count, savestate_flag, proximity_frame_count, world
 
             savestate_flag = was_savestate_loaded(previous, current)
             game_time = current
+            world = get_world()
             paused = False
             paused_frame_count = 0
+            proximity_frame_count = max(0, proximity_frame_count - 1)
 
         def time_unchanged():
             nonlocal game_time, paused, paused_frame_count
@@ -470,14 +486,30 @@ def main():
             paused_frame_count += 1
             if paused_frame_count >= PAUSE_DETECT_WINDOW:
                 paused = True
-                if not is_equal_approx(game_time, 0) and not is_equal_approx(game_time, FRAME_TIME):
-                    print(f'{game_time:7.3f}')
+
+                if (
+                    not time_watcher.output_disabled and
+                    not is_equal_approx(game_time, 0) and 
+                    not is_equal_approx(game_time, FRAME_TIME)
+                    ):
+                    print(f'{game_time:7.3f} Pause')
+
+        def proximity_load_changed(previous, current):
+            nonlocal game_time, proximity_frame_count
+            
+            if not proximity_watcher.output_disabled and proximity_frame_count <= 0:
+                print(f'{game_time:7.3f} Load')
+                proximity_frame_count = PROXIMITY_IGNORE_WINDOW
+        
+        # Unused
+        def proximity_load_unchanged():
+            pass
 
         def room_changed(previous, current):
-            nonlocal game_time, savestate_flag
+            nonlocal game_time, savestate_flag, world
 
             if not is_equal_approx(game_time, 0) and not savestate_flag:
-                print(f'{game_time:7.3f}: {get_room_name(get_world(), previous)}')
+                print(f'{game_time:7.3f} : {get_room_name(world, previous)}')
 
             if savestate_flag:
                 savestate_flag = False
@@ -489,11 +521,34 @@ def main():
         def room_unchanged():
             pass
         
-        time_watcher = MemoryWatcher(get_time, set_time, time_changed, time_unchanged)
-        room_watcher = MemoryWatcher(get_room, set_room, room_changed, room_unchanged)
+        flags = set(arg for arg in sys.argv[1:])
+        HIDE_PAUSE = '-p' in flags
+        HIDE_PROXIMITY = '-x' in flags
+
+        time_watcher = MemoryWatcher(
+                        get_time, 
+                        set_time, 
+                        time_changed, 
+                        time_unchanged, 
+                        HIDE_PAUSE
+                        )
+        proximity_watcher = MemoryWatcher(
+                        get_proximity_load, 
+                        set_proximity_load, 
+                        proximity_load_changed, 
+                        proximity_load_unchanged, 
+                        HIDE_PROXIMITY
+                        )
+        room_watcher = MemoryWatcher(
+                        get_room, 
+                        set_room, 
+                        room_changed, 
+                        room_unchanged, 
+                        False
+                        )
 
         print(" > Scanning...\n")
-        while scan( (time_watcher, room_watcher) ) == OK:
+        while scan( (time_watcher, proximity_watcher, room_watcher) ) == OK:
             sleep(SLEEP_TIME)
 
         print("\n > Error! Hopefully you just closed the game.")
